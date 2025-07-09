@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Real-Time Face Analyzer</title>
+    <!-- Tailwind CSS for styling -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- face-api.js for face detection and analysis -->
+    <script src="https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            overflow: hidden; /* Prevent scrollbars */
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+        }
+        /* Style for the video and canvas to overlay perfectly */
+        #video-container {
+            position: relative;
+            width: 100%;
+            max-width: 720px;
+            aspect-ratio: 16 / 9;
+            border-radius: 0.75rem;
+            overflow: hidden;
+            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.3), 0 10px 10px -5px rgba(0, 0, 0, 0.1);
+        }
+        video, canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+        }
+        video {
+            object-fit: cover;
+        }
+        canvas {
+        }
+        .loader {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #3498db;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body class="bg-gray-900 text-white min-h-screen p-4">
+
+    <div id="loader-container" class="absolute inset-0 bg-gray-900 flex flex-col items-center justify-center z-50">
+        <div class="loader"></div>
+        <p id="loader-text" class="mt-4 text-lg text-gray-300">Loading models...</p>
+    </div>
+
+    <h1 class="text-2xl md:text-3xl font-bold text-center mb-4">Multi-Face Analysis</h1>
+    
+    <!-- Video Feed and Canvas Overlay -->
+    <div id="video-container">
+        <video id="video" playsinline muted autoplay></video>
+        <canvas id="canvas"></canvas>
+    </div>
+    
+    <div class="text-xs text-gray-500 text-center pt-4 max-w-xl">
+        <p><strong>Disclaimer:</strong> This tool provides estimations for entertainment purposes only and is not a medical diagnostic tool. All skin analysis is experimental and highly dependent on lighting conditions.</p>
+    </div>
+
+
+    <script>
+        const video = document.getElementById('video');
+        const canvas = document.getElementById('canvas');
+        const loaderContainer = document.getElementById('loader-container');
+        const loaderText = document.getElementById('loader-text');
+        const ctx = canvas.getContext('2d');
+
+        // Data buffers for smoothing results for multiple faces
+        const faceDataBuffers = {};
+        // INCREASED BUFFER_SIZE for more stable averaging
+        const BUFFER_SIZE = 20; 
+
+        // --- Model Loading ---
+        async function loadModels() {
+            const MODEL_URL = 'https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@0.22.2/weights';
+            try {
+                loaderText.textContent = 'Loading Face Detector...';
+                await faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL);
+                loaderText.textContent = 'Loading Face Landmarks...';
+                await faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL);
+                loaderText.textContent = 'Loading Age & Gender Model...';
+                await faceapi.nets.ageGenderNet.loadFromUri(MODEL_URL);
+                console.log("Models loaded successfully");
+            } catch (error) {
+                console.error("Error loading models:", error);
+                loaderText.textContent = 'Error loading models. Please refresh.';
+            }
+        }
+
+        // --- Webcam Setup ---
+        async function startVideo() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ video: {} });
+                video.srcObject = stream;
+            } catch (err) {
+                console.error("Error accessing webcam:", err);
+                loaderText.innerHTML = 'Could not access webcam. <br> Please grant permission and refresh.';
+            }
+        }
+        
+        video.addEventListener('loadedmetadata', () => {
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+        });
+
+        video.addEventListener('play', () => {
+            loaderContainer.style.display = 'none';
+            setInterval(detectFaces, 500); 
+        });
+
+        // --- Skin Quality Analysis ---
+        function analyzeSkinQuality(image, landmarks) {
+            const tempCanvas = document.createElement('canvas');
+            const tempCtx = tempCanvas.getContext('2d');
+            
+            const leftCheek = landmarks.getJawOutline().slice(1, 5);
+            const rightCheek = landmarks.getJawOutline().slice(12, 16).reverse();
+            const leftEyebrow = landmarks.getLeftEyeBrow();
+            const rightEyebrow = landmarks.getRightEyeBrow();
+            const foreheadTopY = Math.min(...leftEyebrow.map(p => p.y), ...rightEyebrow.map(p => p.y)) - (landmarks.getJawOutline()[8].y - Math.min(...landmarks.getNose().map(p=>p.y))) * 0.5;
+            const forehead = [
+                {x: leftEyebrow[0].x, y: foreheadTopY}, {x: rightEyebrow[4].x, y: foreheadTopY},
+                rightEyebrow[4], leftEyebrow[0]
+            ];
+
+            let totalTexture = 0, totalEvenness = 0, totalBrightness = 0, regionCount = 0;
+
+            [leftCheek, rightCheek, forehead].forEach(region => {
+                const xs = region.map(p => p.x), ys = region.map(p => p.y);
+                const minX = Math.min(...xs), minY = Math.min(...ys);
+                const width = Math.max(...xs) - minX, height = Math.max(...ys) - minY;
+
+                if (width < 15 || height < 15) return;
+                
+                tempCanvas.width = width; tempCanvas.height = height;
+                tempCtx.drawImage(image, minX, minY, width, height, 0, 0, width, height);
+                const imageData = tempCtx.getImageData(0, 0, width, height);
+                const data = imageData.data;
+
+                const { brightness, texture } = calculateBrightnessAndTexture(data);
+                const evenness = calculateEvenness(data);
+                
+                totalBrightness += brightness;
+                totalTexture += texture;
+                totalEvenness += evenness;
+                regionCount++;
+            });
+
+            const defaultResult = { texture: 6, evenness: 10, brightness: 128 };
+            if (regionCount === 0) return defaultResult;
+
+            return {
+                texture: totalTexture / regionCount,
+                evenness: totalEvenness / regionCount,
+                brightness: totalBrightness / regionCount
+            };
+        }
+
+        function calculateBrightnessAndTexture(data) {
+            let sum = 0;
+            const gray = new Uint8ClampedArray(data.length / 4);
+            for (let i = 0; i < data.length; i += 4) {
+                const avg = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+                gray[i / 4] = avg;
+                sum += avg;
+            }
+            const brightness = sum / gray.length;
+            const texture = calculateStandardDeviation(gray);
+            return { brightness, texture };
+        }
+
+        function calculateEvenness(data) {
+            const r = [], g = [], b = [];
+            for (let i = 0; i < data.length; i += 4) {
+                r.push(data[i]);
+                g.push(data[i+1]);
+                b.push(data[i+2]);
+            }
+            const rStdDev = calculateStandardDeviation(r);
+            const gStdDev = calculateStandardDeviation(g);
+            const bStdDev = calculateStandardDeviation(b);
+            return (rStdDev + gStdDev + bStdDev) / 3;
+        }
+
+        function calculateStandardDeviation(data) {
+            const n = data.length;
+            if (n === 0) return 0;
+            const mean = data.reduce((a, b) => a + b, 0) / n;
+            const variance = data.reduce((a, b) => a + (b - mean) ** 2, 0) / n;
+            return Math.sqrt(variance);
+        }
+
+        // --- Helper functions to create labels from raw values ---
+        function getTextureLabel(stdDev) {
+            if (stdDev < 4) return `Smooth (${stdDev.toFixed(1)})`;
+            if (stdDev < 8) return `Light (${stdDev.toFixed(1)})`;
+            if (stdDev < 12) return `Moderate (${stdDev.toFixed(1)})`;
+            return `High (${stdDev.toFixed(1)})`;
+        }
+
+        function getEvennessLabel(stdDev) {
+            if (stdDev < 8) return `Even (${stdDev.toFixed(1)})`;
+            if (stdDev < 15) return `Slightly Uneven (${stdDev.toFixed(1)})`;
+            return `Uneven (${stdDev.toFixed(1)})`;
+        }
+
+        function getBrightnessLabel(value) {
+            if (value < 80) return `Low (${Math.round(value)})`;
+            if (value < 160) return `Medium (${Math.round(value)})`;
+            return `High (${Math.round(value)})`;
+        }
+
+        // --- Main Detection and Drawing Loop ---
+        async function detectFaces() {
+            if (video.paused || video.ended) return;
+
+            const detections = await faceapi.detectAllFaces(video, new faceapi.TinyFaceDetectorOptions())
+                .withFaceLandmarks()
+                .withAgeAndGender();
+
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            const detectedIndices = new Set(detections.map((_, i) => i));
+            for (const key in faceDataBuffers) {
+                if (!detectedIndices.has(parseInt(key))) {
+                    delete faceDataBuffers[key];
+                }
+            }
+
+            detections.forEach((detection, i) => {
+                const resizedDetection = faceapi.resizeResults(detection, { width: canvas.width, height: canvas.height });
+                const box = resizedDetection.detection.box;
+
+                if (!faceDataBuffers[i]) {
+                    faceDataBuffers[i] = { ages: [], textures: [], evennesses: [], brightnesses: [] };
+                }
+                const buffers = faceDataBuffers[i];
+
+                // --- Improved Age Smoothing with Outlier Rejection ---
+                const newAge = resizedDetection.age;
+                let currentSmoothedAge = buffers.ages.length > 0 ? buffers.ages.reduce((a, b) => a + b, 0) / buffers.ages.length : newAge;
+                
+                // Only add new age to buffer if it's not a wild outlier (e.g. > 15 years diff)
+                // Or if the buffer is not yet full, to allow it to populate initially.
+                if (Math.abs(newAge - currentSmoothedAge) < 15 || buffers.ages.length < BUFFER_SIZE / 2) {
+                     buffers.ages.push(newAge);
+                }
+
+                if (buffers.ages.length > BUFFER_SIZE) buffers.ages.shift();
+                const smoothedAge = buffers.ages.reduce((a, b) => a + b, 0) / buffers.ages.length;
+                // --- End of new age smoothing logic ---
+
+
+                const skinAnalysis = analyzeSkinQuality(video, resizedDetection.landmarks);
+                buffers.textures.push(skinAnalysis.texture);
+                buffers.evennesses.push(skinAnalysis.evenness);
+                buffers.brightnesses.push(skinAnalysis.brightness);
+                
+                ['textures', 'evennesses', 'brightnesses'].forEach(key => {
+                    if(buffers[key].length > BUFFER_SIZE) buffers[key].shift();
+                });
+
+                const smoothedTexture = buffers.textures.reduce((a, b) => a + b, 0) / buffers.textures.length;
+                const smoothedEvenness = buffers.evennesses.reduce((a, b) => a + b, 0) / buffers.evennesses.length;
+                const smoothedBrightness = buffers.brightnesses.reduce((a, b) => a + b, 0) / buffers.brightnesses.length;
+
+                ctx.strokeStyle = 'rgba(52, 211, 153, 0.8)';
+                ctx.lineWidth = 3;
+                ctx.strokeRect(box.x, box.y, box.width, box.height);
+                
+                const gender = resizedDetection.gender.charAt(0).toUpperCase() + resizedDetection.gender.slice(1);
+                const text = [
+                    `Age: ${Math.round(smoothedAge)}`,
+                    `Gender: ${gender}`,
+                    `Texture: ${getTextureLabel(smoothedTexture)}`,
+                    `Tone Evenness: ${getEvennessLabel(smoothedEvenness)}`,
+                    `Brightness: ${getBrightnessLabel(smoothedBrightness)}`
+                ];
+                const textHeight = 18;
+                const padding = 5;
+                const bgY = box.y - (textHeight * text.length) - (padding * 2);
+                const bgHeight = (textHeight * text.length) + (padding * 2);
+
+                ctx.fillStyle = 'rgba(0, 0, 0, 0.65)';
+                ctx.fillRect(box.x, bgY > 0 ? bgY : box.y, box.width, bgHeight);
+                
+                ctx.fillStyle = 'rgba(255, 255, 255, 0.95)';
+                ctx.font = `bold ${textHeight - 4}px Inter`;
+                
+                text.forEach((line, index) => {
+                    const textY = (bgY > 0 ? bgY : box.y) + ((index + 1) * textHeight) - (padding);
+                    ctx.fillText(line, box.x + padding, textY);
+                });
+            });
+        }
+
+        // --- Initialization ---
+        async function initialize() {
+            await loadModels();
+            await startVideo();
+        }
+
+        initialize();
+    </script>
+</body>
+</html>
